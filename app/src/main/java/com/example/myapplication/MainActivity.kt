@@ -367,8 +367,13 @@ private fun WifiInfoScreen(modifier: Modifier = Modifier) {
                     }
 
                     is WifiScanState.Loaded -> {
+                        val connectedSsid = (uiState as? WifiUiState.Loaded)?.ssid
                         items(state.networks, key = { it.ssid }) { network ->
-                            WifiNetworkCard(network = network, onReview = { pendingConnect = network })
+                            WifiNetworkCard(
+                                network = network,
+                                isConnected = !connectedSsid.isNullOrBlank() && connectedSsid == network.ssid,
+                                onReview = { pendingConnect = network }
+                            )
                         }
                     }
                 }
@@ -450,6 +455,12 @@ private fun WifiInfoScreen(modifier: Modifier = Modifier) {
                         )
                         activeNetworkCallback = result.callback
                         scope.launch { snackbarHostState.showSnackbar(result.message) }
+
+                        // Give Android a moment to apply the change, then refresh current connection info.
+                        scope.launch {
+                            delay(2000)
+                            refreshTick++
+                        }
                         pendingConnect = null
                     }
                 ) {
@@ -536,11 +547,15 @@ private fun CurrentConnectionCard(
 
                 is WifiUiState.Error -> {
                     Text(state.message, style = MaterialTheme.typography.bodyMedium)
-                    Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                        FilledTonalButton(onClick = onRetry) { Text("Retry") }
-                        FilledTonalButton(onClick = { openWifiSettings(context) }) { Text("Wi-Fi settings") }
+                    Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                        Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                            FilledTonalButton(onClick = onRetry) { Text("Retry") }
+                            FilledTonalButton(onClick = { openWifiSettings(context) }) { Text("Wi-Fi settings") }
+                        }
                         if (state.needsLocation) {
-                            FilledTonalButton(onClick = { openLocationSettings(context) }) { Text("Location settings") }
+                            FilledTonalButton(onClick = { openLocationSettings(context) }) {
+                                Text("Location settings")
+                            }
                         }
                     }
                 }
@@ -560,7 +575,11 @@ private fun SectionHeader(title: String, subtitle: String? = null) {
 }
 
 @Composable
-private fun WifiNetworkCard(network: WifiNetworkItem, onReview: () -> Unit) {
+private fun WifiNetworkCard(
+    network: WifiNetworkItem,
+    isConnected: Boolean,
+    onReview: () -> Unit
+) {
     val signal = signalLabel(network.rssi)
     ElevatedCard(modifier = Modifier.fillMaxWidth()) {
         ListItem(
@@ -569,6 +588,13 @@ private fun WifiNetworkCard(network: WifiNetworkItem, onReview: () -> Unit) {
                 Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                     Text("$signal • ${network.rssi} dBm")
                     Text("Security: ${network.security}")
+                    if (isConnected) {
+                        Text(
+                            "Connected",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.primary
+                        )
+                    }
                 }
             },
             leadingContent = {
@@ -585,7 +611,12 @@ private fun WifiNetworkCard(network: WifiNetworkItem, onReview: () -> Unit) {
             modifier = Modifier.padding(start = 16.dp, end = 16.dp, bottom = 16.dp),
             horizontalArrangement = Arrangement.spacedBy(12.dp)
         ) {
-            FilledTonalButton(onClick = onReview) { Text("Review") }
+            FilledTonalButton(
+                onClick = onReview,
+                enabled = !isConnected
+            ) {
+                Text(if (isConnected) "Connected" else "Review")
+            }
             Text(
                 text = if (network.isOpen) "Open network" else "Password required",
                 style = MaterialTheme.typography.bodySmall,
@@ -723,6 +754,18 @@ private fun readCurrentWifiInfo(context: Context, wifiManager: WifiManager): and
             val transport = caps.transportInfo
             if (transport is android.net.wifi.WifiInfo) {
                 return transport
+            }
+        }
+
+        // If Wi‑Fi is connected but NOT the app's active/default network (e.g., cellular is default),
+        // try to locate any Wi‑Fi transport among all networks.
+        connectivityManager?.allNetworks?.forEach { network ->
+            val networkCaps = connectivityManager.getNetworkCapabilities(network) ?: return@forEach
+            if (!networkCaps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) return@forEach
+            val transport = networkCaps.transportInfo
+            if (transport is android.net.wifi.WifiInfo) {
+                val ssid = normalizeSsid(transport.ssid)
+                if (ssid.isNotBlank()) return transport
             }
         }
     }
@@ -940,6 +983,17 @@ private data class ConnectionResult(
     val callback: ConnectivityManager.NetworkCallback?
 )
 
+private fun isCurrentlyConnectedTo(context: Context, ssid: String): Boolean {
+    return try {
+        val wifiManager = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+        val info = readCurrentWifiInfo(context, wifiManager)
+        val current = normalizeSsid(info?.ssid)
+        current.isNotBlank() && current == ssid
+    } catch (_: Exception) {
+        false
+    }
+}
+
 @SuppressLint("MissingPermission")
 @Suppress("MissingPermission")
 private fun connectToNetwork(
@@ -948,6 +1002,11 @@ private fun connectToNetwork(
     network: WifiNetworkItem,
     password: String
 ): ConnectionResult {
+    // If we're already connected, don't prompt for password again.
+    if (isCurrentlyConnectedTo(context, network.ssid)) {
+        return ConnectionResult("Already connected to ${network.ssid}.", null)
+    }
+
     if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
         openWifiSettings(context)
         return ConnectionResult(
@@ -958,7 +1017,12 @@ private fun connectToNetwork(
 
     if (!network.isOpen) {
         if (password.isBlank()) {
-            return ConnectionResult("Enter the network password to connect.", null)
+            // We cannot read stored Wi‑Fi passwords on modern Android; let the system UI handle it.
+            openWifiPanel(context)
+            return ConnectionResult(
+                "Open the Wi‑Fi panel to connect to ${network.ssid}. Android may not allow apps to auto‑connect without your confirmation.",
+                null
+            )
         }
         if (password.length < 8 && !network.security.contains("WEP", ignoreCase = true)) {
             return ConnectionResult("WPA/WPA2/WPA3 password must be at least 8 characters.", null)
@@ -970,16 +1034,19 @@ private fun connectToNetwork(
             val wifiManager = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
             val suggestionBuilder = android.net.wifi.WifiNetworkSuggestion.Builder().setSsid(network.ssid)
             if (!network.isOpen) {
-                suggestionBuilder.setWpa2Passphrase(password)
+                val isWpa3 = network.security.equals("WPA3", ignoreCase = true) || network.security.contains("SAE", ignoreCase = true)
+                if (isWpa3 && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    try {
+                        suggestionBuilder.setWpa3Passphrase(password)
+                    } catch (_: Exception) {
+                        suggestionBuilder.setWpa2Passphrase(password)
+                    }
+                } else {
+                    suggestionBuilder.setWpa2Passphrase(password)
+                }
             }
-            val hasChangeWifiState = ContextCompat.checkSelfPermission(
-                context,
-                Manifest.permission.CHANGE_WIFI_STATE
-            ) == android.content.pm.PackageManager.PERMISSION_GRANTED
-
-            if (hasChangeWifiState) {
-                wifiManager.addNetworkSuggestions(listOf(suggestionBuilder.build()))
-            }
+            // Some devices require user approval before suggestions can be used.
+            runCatching { wifiManager.addNetworkSuggestions(listOf(suggestionBuilder.build())) }
         }
 
         val specifierBuilder = WifiNetworkSpecifier.Builder()
@@ -1009,13 +1076,31 @@ private fun connectToNetwork(
 
         val callback = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: android.net.Network) {
-                // Network available; system may prompt user confirmation.
+                // Bind this process to the requested Wi‑Fi so subsequent reads of activeNetwork/SSID work,
+                // and networking uses the selected Wi‑Fi.
+                try {
+                    connectivityManager?.bindProcessToNetwork(network)
+                } catch (_: Exception) {
+                    // Ignore; some devices restrict binding.
+                }
+            }
+
+            override fun onLost(network: android.net.Network) {
+                try {
+                    connectivityManager?.bindProcessToNetwork(null)
+                } catch (_: Exception) {
+                    // Ignore
+                }
             }
         }
 
         connectivityManager?.requestNetwork(request, callback)
+
+        // Many OEM devices don't show the confirmation dialog reliably; opening the Wi‑Fi panel gives
+        // the user a guaranteed way to confirm / select the network.
+        openWifiPanel(context)
         ConnectionResult(
-            "Connecting to ${network.ssid}. Confirm the system prompt if it appears.",
+            "Connecting to ${network.ssid}. Confirm the system prompt / Wi‑Fi panel if it appears.",
             callback
         )
     } catch (e: IllegalArgumentException) {
@@ -1029,6 +1114,17 @@ private fun connectToNetwork(
 
 private fun openWifiSettings(context: Context) {
     val intent = Intent(Settings.ACTION_WIFI_SETTINGS).apply {
+        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+    }
+    context.startActivity(intent)
+}
+
+private fun openWifiPanel(context: Context) {
+    val intent = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+        Intent(Settings.Panel.ACTION_WIFI)
+    } else {
+        Intent(Settings.ACTION_WIFI_SETTINGS)
+    }.apply {
         addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
     }
     context.startActivity(intent)
